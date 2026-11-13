@@ -81,11 +81,11 @@ func BenchmarkBuild(b *testing.B) {
 	}
 }
 
-func BenchmarkIsZhS(b *testing.B) {
-	text := string(benchInputs(b)[0].in)
-	b.SetBytes(int64(len(text)))
-	b.ReportAllocs()
-	for b.Loop() {
-		IsZhS(text)
-	}
-}
+// func BenchmarkIsZhS(b *testing.B) {
+// 	text := string(benchInputs(b)[0].in)
+// 	b.SetBytes(int64(len(text)))
+// 	b.ReportAllocs()
+// 	for b.Loop() {
+// 		IsZhS(text)
+// 	}
+// }
