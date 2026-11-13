@@ -1,0 +1,32 @@
+name: Lint
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  golangci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      # go.mod replaces cedar with a local checkout for development.
+      - name: Use the published cedar
+        run: |
+          go mod edit -dropreplace=github.com/vcaesar/cedar
+          go mod tidy
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15
+
+      - name: golangci-lint (-tags ne)
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15
+          args: --build-tags ne

@@ -1,0 +1,44 @@
+name: Go
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        go: [1.26.x, 1.27.x]
+        os: [macOS-latest, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      # data/ and testdata/ golden files must keep LF line endings.
+      - name: Disable CRLF conversion
+        run: git config --global core.autocrlf false
+
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v6
+
+      - name: Set up Go ${{ matrix.go }}
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+
+      # go.mod replaces cedar with a local checkout for development.
+      - name: Use the published cedar
+        run: |
+          go mod edit -dropreplace=github.com/vcaesar/cedar
+          go mod tidy
+
+      - name: Build
+        run: go build -v ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Test without embedded dictionaries
+        run: go test -tags ne -run TestNoEmbed .
