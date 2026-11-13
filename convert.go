@@ -6,15 +6,18 @@ import "unicode/utf8"
 // as is; a complete ideographic description sequence (e.g. "⿰氵青") is
 // copied whole so its components are not converted one by one.
 func convert(dst []byte, m matcher, s []byte) []byte {
-	start := 0 // start of the pending unmatched run
+	first := m.starts() // most runes start no key and skip the match call
+	start := 0          // start of the pending unmatched run
 	for i := 0; i < len(s); {
 		r, size := runeAt(s[i:])
-		if n, v := m.match(s[i:], r); n > 0 {
-			dst = append(dst, s[start:i]...)
-			dst = append(dst, v...)
-			i += n
-			start = i
-			continue
+		if first.has(r) {
+			if n, v := m.match(s[i:], r); n > 0 {
+				dst = append(dst, s[start:i]...)
+				dst = append(dst, v...)
+				i += n
+				start = i
+				continue
+			}
 		}
 		i += skipLen(s[i:], r, size)
 	}
@@ -24,10 +27,14 @@ func convert(dst []byte, m matcher, s []byte) []byte {
 // segment calls fn with the segments of s found by maximum matching against
 // m: each matched key is a segment, and so is each run of unmatched text.
 func segment(m matcher, s []byte, fn func(seg []byte)) {
+	first := m.starts()
 	start := 0
 	for i := 0; i < len(s); {
 		r, size := runeAt(s[i:])
-		n, _ := m.match(s[i:], r)
+		n := 0
+		if first.has(r) {
+			n, _ = m.match(s[i:], r)
+		}
 		if n == 0 {
 			i += skipLen(s[i:], r, size)
 			continue
@@ -47,9 +54,15 @@ func segment(m matcher, s []byte, fn func(seg []byte)) {
 // skipLen is the length of the unmatched unit at the head of s: a complete
 // ideographic description sequence or else its first rune r of size bytes.
 func skipLen(s []byte, r rune, size int) int {
-	if idsArity(r) == 0 {
+	if r < 0x2FF0 || r > 0x2FFF { // not an operator, see idsArity
 		return size
 	}
+	return idsSkip(s, size)
+}
+
+// idsSkip is skipLen for s starting with an operator; it is apart so that
+// skipLen inlines.
+func idsSkip(s []byte, size int) int {
 	runes := 0
 	if n, ok := idsLen(s, 16, &runes); ok {
 		return n
@@ -98,10 +111,13 @@ func idsArity(r rune) int {
 // normalize returns s converted by m, or s itself when nothing matches,
 // so text needing no normalization is not copied.
 func normalize(m matcher, s []byte) []byte {
+	first := m.starts()
 	for i := 0; i < len(s); {
 		r, size := runeAt(s[i:])
-		if n, _ := m.match(s[i:], r); n > 0 {
-			return convert(append(make([]byte, 0, len(s)), s[:i]...), m, s[i:])
+		if first.has(r) {
+			if n, _ := m.match(s[i:], r); n > 0 {
+				return convert(append(make([]byte, 0, len(s)), s[:i]...), m, s[i:])
+			}
 		}
 		i += skipLen(s[i:], r, size)
 	}
