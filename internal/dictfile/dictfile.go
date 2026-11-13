@@ -22,22 +22,24 @@ func Parse(data []byte) ([]Entry, error) {
 	data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
 	var entries []Entry
 	seen := make(map[string]struct{})
-	for n, line := range strings.Split(string(data), "\n") {
+	n := 0
+	for line := range strings.SplitSeq(string(data), "\n") {
+		n++
 		line = strings.TrimSuffix(line, "\r")
 		if line == "" || line[0] == '#' {
 			continue
 		}
 		key, rest, ok := strings.Cut(line, "\t")
 		if !ok || key == "" {
-			return nil, fmt.Errorf("line %d: missing key or tab: %q", n+1, line)
+			return nil, fmt.Errorf("line %d: missing key or tab: %q", n, line)
 		}
 		// like OpenCC, values are separated by single spaces only
 		values := strings.Split(rest, " ")
 		if values[0] == "" {
-			return nil, fmt.Errorf("line %d: no value for key %q", n+1, key)
+			return nil, fmt.Errorf("line %d: no value for key %q", n, key)
 		}
 		if _, dup := seen[key]; dup {
-			return nil, fmt.Errorf("line %d: duplicate key %q", n+1, key)
+			return nil, fmt.Errorf("line %d: duplicate key %q", n, key)
 		}
 		seen[key] = struct{}{}
 		entries = append(entries, Entry{Key: key, Values: values})

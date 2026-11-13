@@ -2,6 +2,7 @@ package gocc
 
 import (
 	"encoding/json"
+	"math/rand/v2"
 	"os"
 	"regexp"
 	"sort"
@@ -9,6 +10,10 @@ import (
 	"sync"
 	"testing"
 	"testing/fstest"
+	"unicode/utf8"
+	"unsafe"
+
+	"github.com/go-ego/gocc/internal/dictfile"
 )
 
 // trailingComma matches the trailing commas upstream testcases.json allows.
@@ -436,6 +441,61 @@ func TestConfigStrictErrors(t *testing.T) {
 	}
 }
 
+// TestConfigTofuValidation checks that, like Config.cpp, a dictionary
+// dropped for its tofu risk is not validated further, an inline one is
+// always rejected, and the group policy does not change either rule.
+func TestConfigTofuValidation(t *testing.T) {
+	cases := []struct {
+		dict string
+		ok   bool // without WithTofuRisk; with it every case is an error
+	}{
+		{`{"type":"zip","may_output_tofu":true}`, true},
+		{`{"type":"text","may_output_tofu":true}`, true},
+		{`{"type":"group","may_output_tofu":true}`, true},
+		{`{"type":"group","match_policy":"union","may_output_tofu":true}`, true},
+		{`{"type":"inline","may_output_tofu":true,"entries":{"a":"b"}}`, false},
+		{`{"type":"group","match_policy":"union"}`, false},
+	}
+	for _, c := range cases {
+		for _, policy := range []string{"short_circuit", "union"} {
+			config := `{"name":"x","conversion_chain":[{"dict":{"type":"group","match_policy":"` +
+				policy + `","dicts":[` + c.dict + `]}}]}`
+			conv, err := NewFromConfig([]byte(config), nil)
+			if (err == nil) != c.ok {
+				t.Errorf("%s in %s: err = %v, want ok %v", c.dict, policy, err, c.ok)
+			} else if c.ok && conv.Convert("a") != "a" {
+				t.Errorf("%s in %s: dropped dict converts", c.dict, policy)
+			}
+			if _, err := NewFromConfig([]byte(config), nil, WithTofuRisk()); err == nil {
+				t.Errorf("%s in %s with tofu risk: want error", c.dict, policy)
+			}
+		}
+	}
+}
+
+// TestConfigCommas checks only a comma after a value may trail.
+func TestConfigCommas(t *testing.T) {
+	entries := func(body string) string {
+		return `{"name":"x","conversion_chain":[{"dict":{"type":"inline","entries":` + body + `}}]}`
+	}
+	if got := testConfig(t, entries(`{"a":"b", /* c */ }`), nil).Convert("a"); got != "b" {
+		t.Errorf("trailing comma: got %q", got)
+	}
+	bad := []string{
+		`{"name":"x","conversion_chain":[,]}`,
+		`{"name":"x","conversion_chain":[],,}`,
+		`{,"name":"x","conversion_chain":[]}`,
+		entries(`{,}`),
+		entries(`{"a":,}`),
+		entries(`{"a":"b",,}`),
+	}
+	for _, config := range bad {
+		if _, err := NewFromConfig([]byte(config), nil); err == nil {
+			t.Errorf("NewFromConfig(%s) want error", config)
+		}
+	}
+}
+
 // TestOcdAliasShared checks X.ocd2 and X.txt resolve to one cached trie.
 func TestOcdAliasShared(t *testing.T) {
 	l := newLoader(nil, fstest.MapFS{"a.txt": {Data: []byte("a\tb\n")}})
@@ -472,5 +532,144 @@ func TestNormalize(t *testing.T) {
 	n, _ := m.norm[0].(*trie), 0
 	if out := normalize(n, in); &out[0] != &in[0] {
 		t.Error("unchanged text should not be copied")
+	}
+}
+
+// TestTrieDuplicates checks the earliest list wins a duplicate key, and
+// that a key is not taken for present when it only prefixes another.
+func TestTrieDuplicates(t *testing.T) {
+	m, err := newTrie(
+		[]dictfile.Entry{{Key: "ab", Values: []string{"1"}}},
+		[]dictfile.Entry{{Key: "a", Values: []string{"2"}}, {Key: "ab", Values: []string{"3"}},
+			{Key: "abc", Values: []string{"4"}}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for in, want := range map[string]string{"a": "2", "ab": "1", "abc": "4", "abab": "11", "b": "b"} {
+		if got := string(convert(nil, m, []byte(in))); got != want {
+			t.Errorf("%q: got %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestRuneAt checks the decoder against unicode/utf8 on every three-byte
+// sequence, which it decodes itself, and on the other lengths.
+func TestRuneAt(t *testing.T) {
+	check := func(s []byte) {
+		r, size := runeAt(s)
+		if wr, wsize := utf8.DecodeRune(s); r != wr || size != wsize {
+			t.Fatalf("runeAt(% x) = %U, %d; want %U, %d", s, r, size, wr, wsize)
+		}
+	}
+	for b0 := 0xE0; b0 <= 0xEF; b0++ {
+		for b1 := range 0x100 {
+			for b2 := range 0x100 {
+				check([]byte{byte(b0), byte(b1), byte(b2)})
+			}
+		}
+	}
+	for _, s := range []string{"a", "\x00", "é", "\xe4", "\xe4\xb8", "😀", "\U0002F800", "\xf0\x9f\x98", "\x80", "\xff"} {
+		check([]byte(s))
+	}
+}
+
+// TestConvertReference compares s2t's matcher with a map-based longest
+// prefix match on random mixes of keys, cut keys, NUL and invalid bytes.
+func TestConvertReference(t *testing.T) {
+	read := func(name string) []dictfile.Entry {
+		data, err := os.ReadFile("data/dictionary/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries, err := dictfile.Parse(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return entries
+	}
+	// s2t: short_circuit[union[STPhrases, generated], STCharacters]
+	phrases, chars := map[string]string{}, map[string]string{}
+	var keys []string
+	maxLen := 0
+	for _, e := range append(read("STPhrases.txt"), read("STPhrases_GeneratedFromRegionalPhrases.txt")...) {
+		if _, ok := phrases[e.Key]; !ok {
+			phrases[e.Key] = e.Values[0]
+			keys = append(keys, e.Key)
+			maxLen = max(maxLen, len(e.Key))
+		}
+	}
+	for _, e := range read("STCharacters.txt") {
+		chars[e.Key] = e.Values[0]
+		keys = append(keys, e.Key)
+	}
+	reference := func(s string) string {
+		var out []byte
+		for i := 0; i < len(s); {
+			n, val := 0, ""
+			for _, dict := range []map[string]string{phrases, chars} {
+				for j := min(len(s), i+maxLen); j > i && n == 0; j-- {
+					if v, ok := dict[s[i:j]]; ok {
+						n, val = j-i, v
+					}
+				}
+			}
+			if n == 0 {
+				_, n = utf8.DecodeRuneInString(s[i:])
+				val = s[i : i+n]
+			}
+			out = append(out, val...)
+			i += n
+		}
+		return string(out)
+	}
+
+	noise := []string{"a", " ", "，", "\x00", "\xff", "\xe6\xb1", "\uFFFD", "𫝈", "鿿", "\n"}
+	rng := rand.New(rand.NewPCG(1, 2))
+	m := MustNew("s2t").chain[0]
+	for range 3000 {
+		var in []byte
+		for range 1 + rng.IntN(12) {
+			switch key := keys[rng.IntN(len(keys))]; rng.IntN(4) {
+			case 0:
+				in = append(in, noise[rng.IntN(len(noise))]...)
+			case 1:
+				in = append(in, key[:rng.IntN(len(key))]...) // may cut a rune
+			default:
+				in = append(in, key...)
+			}
+		}
+		if got, want := string(convert(nil, m, in)), reference(string(in)); got != want {
+			t.Fatalf("convert(%q)\n got: %q\nwant: %q", in, got, want)
+		}
+	}
+}
+
+// TestAllocs guards the allocation-free conversion path.
+func TestAllocs(t *testing.T) {
+	in := "鼠标和内存 hello 头发发财，不能踏入同一条河流"
+	for _, name := range []string{"s2t", "t2s"} { // single conversions use no pool
+		c := MustNew(name)
+		src, dst := []byte(in), make([]byte, 0, 4*len(in))
+		if n := testing.AllocsPerRun(100, func() { dst = c.AppendConvert(dst[:0], src) }); n != 0 {
+			t.Errorf("%s: AppendConvert allocates %v times", name, n)
+		}
+		if n := testing.AllocsPerRun(100, func() { c.Convert(in) }); n != 1 {
+			t.Errorf("%s: Convert allocates %v times, want 1", name, n)
+		}
+	}
+}
+
+// TestConvertString checks Convert neither aliases nor changes its input.
+func TestConvertString(t *testing.T) {
+	c := MustNew("s2t")
+	in := strings.Repeat("abc", 3)
+	out := c.Convert(in)
+	if out != in || unsafe.StringData(out) == unsafe.StringData(in) {
+		t.Fatalf("unchanged text: got %q, aliased %v", out, unsafe.StringData(out) == unsafe.StringData(in))
+	}
+	in = strings.Repeat("汉字", 3)
+	if got := c.Convert(in); got != "漢字漢字漢字" || in != "汉字汉字汉字" {
+		t.Fatalf("got %q, input now %q", got, in)
 	}
 }

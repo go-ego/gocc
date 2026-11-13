@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unsafe"
 )
 
 // Converter converts text with one OpenCC configuration.
@@ -169,7 +170,9 @@ func (c *Converter) target() string {
 func (c *Converter) Convert(s string) string {
 	// Chinese conversion rarely changes the length much
 	dst := make([]byte, 0, len(s)+len(s)/8)
-	return string(c.AppendConvert(dst, []byte(s)))
+	// no copies: AppendConvert only reads s, and dst is not used again
+	dst = c.AppendConvert(dst, unsafe.Slice(unsafe.StringData(s), len(s)))
+	return unsafe.String(unsafe.SliceData(dst), len(dst))
 }
 
 // scratch holds the intermediate buffers of a conversion chain.

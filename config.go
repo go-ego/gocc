@@ -77,24 +77,22 @@ func (e *inlineEntries) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// loader builds matchers from dictionary files and caches the parsed files
-// and built tries, so converters sharing a loader share memory. A file is
-// searched in each of fsys in order, then in next, whose cache is shared.
+// loader builds matchers from dictionary files and caches the built tries,
+// so converters sharing a loader share memory. A file is searched in each
+// of fsys in order, then in next, whose cache is shared.
 type loader struct {
 	fsys []fs.FS
 	next *loader
 
-	mu      sync.Mutex
-	entries map[string][]dictfile.Entry
-	tries   map[string]*trie
+	mu    sync.Mutex
+	tries map[string]*trie
 }
 
 func newLoader(next *loader, fsys ...fs.FS) *loader {
 	return &loader{
-		fsys:    fsys,
-		next:    next,
-		entries: make(map[string][]dictfile.Entry),
-		tries:   make(map[string]*trie),
+		fsys:  fsys,
+		next:  next,
+		tries: make(map[string]*trie),
 	}
 }
 
@@ -152,13 +150,15 @@ func (l *loader) chain(specs []conversionSpec, tofu bool) ([]matcher, error) {
 
 // dict builds the matcher for d; it is nil when every dictionary is excluded.
 func (l *loader) dict(d *dictSpec, tofu bool) (matcher, error) {
-	switch d.Type {
-	case "inline":
+	if d.Type == "inline" {
 		return inlineDict(d)
+	}
+	// like Config.cpp, an excluded dictionary is not validated further
+	if d.excluded(tofu) {
+		return nil, nil
+	}
+	switch d.Type {
 	case "text", "ocd", "ocd2":
-		if d.excluded(tofu) {
-			return nil, nil
-		}
 		if d.File == "" {
 			return nil, fmt.Errorf("gocc: %s dict has no file", d.Type)
 		}
@@ -182,9 +182,6 @@ func inlineDict(d *dictSpec) (matcher, error) {
 func (l *loader) group(d *dictSpec, tofu bool) (matcher, error) {
 	if d.Dicts == nil {
 		return nil, errors.New("gocc: group dict has no dicts")
-	}
-	if d.excluded(tofu) {
-		return nil, nil
 	}
 	policy := "short_circuit"
 	if d.MatchPolicy != nil {
@@ -224,8 +221,12 @@ func (l *loader) group(d *dictSpec, tofu bool) (matcher, error) {
 }
 
 // unionFiles lists, in order, the files of a group tree made only of union
-// groups and file dictionaries; ok is false for any other shape.
+// groups and file dictionaries; ok is false for any other shape, which
+// dict then builds or rejects.
 func unionFiles(d *dictSpec, tofu bool) (files []string, ok bool) {
+	if d.Type == "inline" {
+		return nil, false
+	}
 	if d.excluded(tofu) {
 		return nil, true
 	}
@@ -233,7 +234,7 @@ func unionFiles(d *dictSpec, tofu bool) (files []string, ok bool) {
 	case "text", "ocd", "ocd2":
 		return []string{txtName(d.File)}, d.File != ""
 	case "group":
-		if d.MatchPolicy == nil || *d.MatchPolicy != "union" {
+		if d.Dicts == nil || d.MatchPolicy == nil || *d.MatchPolicy != "union" {
 			return nil, false
 		}
 		for i := range d.Dicts {
@@ -300,16 +301,18 @@ func txtName(file string) string {
 	return file
 }
 
-// load parses a text dictionary. The caller holds l.mu.
+// load parses a text dictionary. The entries are not kept: a file goes
+// into one trie in practice, which is what the loader caches.
 func (l *loader) load(name string) ([]dictfile.Entry, error) {
-	if entries, ok := l.entries[name]; ok {
-		return entries, nil
-	}
 	err := fmt.Errorf("gocc: load dict %s: no dictionary file system (built with -tags ne? use LoadDict)", name)
 	for _, fsys := range l.fsys {
 		data, rerr := fs.ReadFile(fsys, name)
 		if rerr == nil {
-			return l.parse(name, data)
+			entries, perr := dictfile.Parse(data)
+			if perr != nil {
+				return nil, fmt.Errorf("gocc: dict %s: %w", name, perr)
+			}
+			return entries, nil
 		}
 		err = fmt.Errorf("gocc: load dict %s: %w", name, rerr)
 		if !errors.Is(rerr, fs.ErrNotExist) {
@@ -317,32 +320,22 @@ func (l *loader) load(name string) ([]dictfile.Entry, error) {
 		}
 	}
 	if l.next != nil {
-		l.next.mu.Lock()
-		defer l.next.mu.Unlock()
 		return l.next.load(name)
 	}
 	return nil, err
-}
-
-func (l *loader) parse(name string, data []byte) ([]dictfile.Entry, error) {
-	entries, err := dictfile.Parse(data)
-	if err != nil {
-		return nil, fmt.Errorf("gocc: dict %s: %w", name, err)
-	}
-	l.entries[name] = entries
-	return entries, nil
 }
 
 // stripJSONC blanks // and /* */ comments outside strings and drops
 // trailing commas before '}' or ']'.
 func stripJSONC(data []byte) []byte {
 	out := make([]byte, 0, len(data))
-	comma := -1 // index in out of a pending comma
+	comma := -1    // index in out of a pending comma
+	value := false // the last token ends a value, which a comma may follow
 	for i := 0; i < len(data); i++ {
 		c := data[i]
 		switch {
 		case c == '"':
-			comma = -1
+			comma, value = -1, true
 			j := i + 1
 			for ; j < len(data) && data[j] != '"'; j++ {
 				if data[j] == '\\' {
@@ -364,18 +357,22 @@ func stripJSONC(data []byte) []byte {
 			}
 			i += end + 3
 		case c == ',':
-			comma = len(out)
+			comma = -1
+			if value { // "[,]" and "[1,,]" stay invalid
+				comma = len(out)
+			}
+			value = false
 			out = append(out, c)
 		case c == '}' || c == ']':
 			if comma >= 0 {
 				out[comma] = ' '
 			}
-			comma = -1
+			comma, value = -1, true
 			out = append(out, c)
 		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
 			out = append(out, c)
 		default:
-			comma = -1
+			comma, value = -1, c != '[' && c != '{' && c != ':'
 			out = append(out, c)
 		}
 	}

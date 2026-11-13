@@ -55,9 +55,19 @@ func (s *runeSet) union(o *runeSet) {
 
 // runeAt decodes the rune at the head of non-empty s and its size; an
 // invalid byte decodes as utf8.RuneError of size 1.
-func runeAt(s []byte) (rune, int) {
-	if s[0] < utf8.RuneSelf {
-		return rune(s[0]), 1
+func runeAt(s []byte) (r rune, size int) {
+	r, size = rune(s[0]), 1
+	if r >= utf8.RuneSelf {
+		r, size = decodeRune(s)
+	}
+	return
+}
+
+// decodeRune is runeAt past ASCII, apart so that runeAt inlines. Lead
+// bytes E1-EC, which most CJK text has, admit any two continuation bytes.
+func decodeRune(s []byte) (rune, int) {
+	if b := s[0]; b >= 0xE1 && b <= 0xEC && len(s) >= 3 && s[1]&0xC0 == 0x80 && s[2]&0xC0 == 0x80 {
+		return rune(b&0x0F)<<12 | rune(s[1]&0x3F)<<6 | rune(s[2]&0x3F), 3
 	}
 	return utf8.DecodeRune(s)
 }
@@ -74,19 +84,18 @@ type trie struct {
 // key the earliest one wins, which is OpenCC's union tie-break.
 func newTrie(lists ...[]dictfile.Entry) (*trie, error) {
 	t := &trie{cd: cedar.New()}
-	seen := make(map[string]struct{})
 	for _, entries := range lists {
 		for _, e := range entries {
-			if _, ok := seen[e.Key]; ok {
-				continue
-			}
-			seen[e.Key] = struct{}{}
 			// match walks whole runes, and cedar uses label 0 as its
 			// terminal edge
 			if !utf8.ValidString(e.Key) || strings.IndexByte(e.Key, 0) >= 0 {
 				return nil, fmt.Errorf("gocc: dict key is not valid UTF-8 or contains NUL: %q", e.Key)
 			}
-			if err := t.cd.Insert([]byte(e.Key), len(t.vals)); err != nil {
+			key := []byte(e.Key)
+			if _, err := t.cd.Get(key); err == nil {
+				continue // an earlier entry has the key
+			}
+			if err := t.cd.Insert(key, len(t.vals)); err != nil {
 				return nil, err
 			}
 			t.vals = append(t.vals, e.Values[0])
